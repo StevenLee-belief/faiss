@@ -1,6 +1,8 @@
 var searchData=
 [
   ['baseshiftdistancecorrection',['BaseShiftDistanceCorrection',['../structfaiss_1_1BaseShiftDistanceCorrection.html',1,'faiss']]],
+  ['binaryflatindex',['BinaryFlatIndex',['../classfaiss_1_1gpu_1_1BinaryFlatIndex.html',1,'faiss::gpu']]],
+  ['binaryinvertedlistscanner',['BinaryInvertedListScanner',['../structfaiss_1_1BinaryInvertedListScanner.html',1,'faiss']]],
   ['bitonicmergestep',['BitonicMergeStep',['../structfaiss_1_1gpu_1_1BitonicMergeStep.html',1,'faiss::gpu']]],
   ['bitonicmergestep_3c_20k_2c_20v_2c_201_2c_20dir_2c_20comp_2c_20low_2c_20true_20_3e',['BitonicMergeStep&lt; K, V, 1, Dir, Comp, Low, true &gt;',['../structfaiss_1_1gpu_1_1BitonicMergeStep_3_01K_00_01V_00_011_00_01Dir_00_01Comp_00_01Low_00_01true_01_4.html',1,'faiss::gpu']]],
   ['bitonicmergestep_3c_20k_2c_20v_2c_20n_2c_20dir_2c_20comp_2c_20false_2c_20false_20_3e',['BitonicMergeStep&lt; K, V, N, Dir, Comp, false, false &gt;',['../structfaiss_1_1gpu_1_1BitonicMergeStep_3_01K_00_01V_00_01N_00_01Dir_00_01Comp_00_01false_00_01false_01_4.html',1,'faiss::gpu']]],

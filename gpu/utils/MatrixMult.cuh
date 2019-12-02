@@ -1,18 +1,15 @@
 /**
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD+Patents license found in the
+ * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 #pragma once
 
 #include <cublas_v2.h>
-#include "Float16.cuh"
-#include "Tensor.cuh"
+#include <faiss/gpu/utils/Tensor.cuh>
 
 namespace faiss { namespace gpu {
 
@@ -29,7 +26,6 @@ void runMatrixMult(Tensor<float, 2, true>& c, bool transC,
                    cublasHandle_t handle,
                    cudaStream_t stream);
 
-#ifdef FAISS_USE_FLOAT16
 /// C = alpha * A * B + beta * C
 /// Expects row major layout, not fortran/blas column major!
 void runMatrixMult(Tensor<half, 2, true>& c, bool transC,
@@ -40,7 +36,6 @@ void runMatrixMult(Tensor<half, 2, true>& c, bool transC,
                    bool useHgemm,
                    cublasHandle_t handle,
                    cudaStream_t stream);
-#endif
 
 /// C_i = alpha * A_i * B_i + beta * C_i
 /// where `i` is the outermost dimension, via iterated gemm

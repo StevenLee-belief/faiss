@@ -1,22 +1,20 @@
 /**
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD+Patents license found in the
+ * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
-// Copyright 2004-present Facebook. All Rights Reserved.
 
-#include "GpuIndexIVFFlat.h"
-#include "../IndexFlat.h"
-#include "../IndexIVF.h"
-#include "GpuIndexFlat.h"
-#include "GpuResources.h"
-#include "impl/IVFFlat.cuh"
-#include "utils/CopyUtils.cuh"
-#include "utils/DeviceUtils.h"
-#include "utils/Float16.cuh"
+#include <faiss/gpu/GpuIndexIVFFlat.h>
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFFlat.h>
+#include <faiss/gpu/GpuIndexFlat.h>
+#include <faiss/gpu/GpuResources.h>
+#include <faiss/gpu/impl/IVFFlat.cuh>
+#include <faiss/gpu/utils/CopyUtils.cuh>
+#include <faiss/gpu/utils/DeviceUtils.h>
+#include <faiss/gpu/utils/Float16.cuh>
 
 #include <limits>
 
@@ -33,11 +31,6 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(GpuResources* resources,
     ivfFlatConfig_(config),
     reserveMemoryVecs_(0),
     index_(nullptr) {
-#ifndef FAISS_USE_FLOAT16
-  FAISS_THROW_IF_NOT_MSG(!ivfFlatConfig_.useFloat16IVFStorage,
-                     "float16 unsupported; need CUDA SDK >= 7.5");
-#endif
-
   copyFrom(index);
 }
 
@@ -53,11 +46,6 @@ GpuIndexIVFFlat::GpuIndexIVFFlat(GpuResources* resources,
 
   // faiss::Index params
   this->is_trained = false;
-
-#ifndef FAISS_USE_FLOAT16
-  FAISS_THROW_IF_NOT_MSG(!ivfFlatConfig_.useFloat16IVFStorage,
-                     "float16 unsupported; need CUDA SDK >= 7.5");
-#endif
 
   // We haven't trained ourselves, so don't construct the IVFFlat
   // index yet
@@ -95,19 +83,16 @@ GpuIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
 
   // Copy our lists as well
   index_ = new IVFFlat(resources_,
-                       quantizer_->getGpuData(),
-                       index->metric_type == faiss::METRIC_L2,
-                       ivfFlatConfig_.useFloat16IVFStorage,
+                       quantizer->getGpuData(),
+                       index->metric_type,
+                       false, // no residual
+                       nullptr, // no scalar quantizer
                        ivfFlatConfig_.indicesOptions,
                        memorySpace_);
+  InvertedLists *ivf = index->invlists;
 
-  FAISS_ASSERT(index->codes.size() == index->ids.size());
-  for (size_t i = 0; i < index->ids.size(); ++i) {
-    auto& cvecs = index->codes[i];
-    auto& ids = index->ids[i];
-
-    FAISS_ASSERT(cvecs.size() == (this->d * sizeof(float) * ids.size()));
-    auto numVecs = ids.size();
+  for (size_t i = 0; i < ivf->nlist; ++i) {
+    auto numVecs = ivf->list_size(i);
 
     // GPU index can only support max int entries per list
     FAISS_THROW_IF_NOT_FMT(numVecs <=
@@ -115,11 +100,12 @@ GpuIndexIVFFlat::copyFrom(const faiss::IndexIVFFlat* index) {
                        "GPU inverted list can only support "
                        "%zu entries; %zu found",
                        (size_t) std::numeric_limits<int>::max(),
-                       ids.size());
+                       numVecs);
 
-    index_->addCodeVectorsFromCpu(
-             i, (const float*)(cvecs.data()),
-             ids.data(), numVecs);
+    index_->addCodeVectorsFromCpu(i,
+                                  (const unsigned char*)(ivf->get_codes(i)),
+                                  ivf->get_ids(i),
+                                  numVecs);
   }
 }
 
@@ -129,23 +115,25 @@ GpuIndexIVFFlat::copyTo(faiss::IndexIVFFlat* index) const {
 
   // We must have the indices in order to copy to ourselves
   FAISS_THROW_IF_NOT_MSG(ivfFlatConfig_.indicesOptions != INDICES_IVF,
-                     "Cannot copy to CPU as GPU index doesn't retain "
-                     "indices (INDICES_IVF)");
+                         "Cannot copy to CPU as GPU index doesn't retain "
+                         "indices (INDICES_IVF)");
 
   GpuIndexIVF::copyTo(index);
+  index->code_size = this->d * sizeof(float);
 
-  // Clear out the old inverted lists
-  index->codes.clear();
-  index->codes.resize(nlist_);
+  InvertedLists *ivf = new ArrayInvertedLists(nlist, index->code_size);
+  index->replace_invlists(ivf, true);
 
   // Copy the inverted lists
   if (index_) {
-    for (int i = 0; i < nlist_; ++i) {
-      std::vector<float> vec = index_->getListVectors(i);
-      size_t nbyte = sizeof(float) * vec.size();
-      index->codes[i].resize(nbyte);
-      memcpy(index->codes[i].data(), vec.data(), nbyte);
-      index->ids[i] = index_->getListIndices(i);
+    for (int i = 0; i < nlist; ++i) {
+      auto listIndices = index_->getListIndices(i);
+      auto listData = index_->getListVectors(i);
+
+      ivf->add_entries(i,
+                       listIndices.size(),
+                       listIndices.data(),
+                       (const uint8_t*) listData.data());
     }
   }
 }
@@ -178,8 +166,8 @@ GpuIndexIVFFlat::train(Index::idx_t n, const float* x) {
   DeviceScope scope(device_);
 
   if (this->is_trained) {
-    FAISS_ASSERT(quantizer_->is_trained);
-    FAISS_ASSERT(quantizer_->ntotal == nlist_);
+    FAISS_ASSERT(quantizer->is_trained);
+    FAISS_ASSERT(quantizer->ntotal == nlist);
     FAISS_ASSERT(index_);
     return;
   }
@@ -190,9 +178,10 @@ GpuIndexIVFFlat::train(Index::idx_t n, const float* x) {
 
   // The quantizer is now trained; construct the IVF index
   index_ = new IVFFlat(resources_,
-                       quantizer_->getGpuData(),
-                       this->metric_type == faiss::METRIC_L2,
-                       ivfFlatConfig_.useFloat16IVFStorage,
+                       quantizer->getGpuData(),
+                       this->metric_type,
+                       false, // no residual
+                       nullptr, // no scalar quantizer
                        ivfFlatConfig_.indicesOptions,
                        memorySpace_);
 
@@ -204,73 +193,45 @@ GpuIndexIVFFlat::train(Index::idx_t n, const float* x) {
 }
 
 void
-GpuIndexIVFFlat::addImpl_(Index::idx_t n,
+GpuIndexIVFFlat::addImpl_(int n,
                           const float* x,
                           const Index::idx_t* xids) {
-  // Device is already set in GpuIndex::addInternal_
+  // Device is already set in GpuIndex::add
   FAISS_ASSERT(index_);
   FAISS_ASSERT(n > 0);
 
-  auto stream = resources_->getDefaultStreamCurrentDevice();
-
-  auto deviceVecs =
-    toDevice<float, 2>(resources_,
-                       device_,
-                       const_cast<float*>(x),
-                       stream,
-                       {(int) n, index_->getDim()});
+  // Data is already resident on the GPU
+  Tensor<float, 2, true> data(const_cast<float*>(x), {n, (int) this->d});
 
   static_assert(sizeof(long) == sizeof(Index::idx_t), "size mismatch");
-  auto deviceIds =
-    toDevice<long, 1>(resources_,
-                      device_,
-                      const_cast<long*>(xids),
-                      stream,
-                      {(int) n});
+  Tensor<long, 1, true> labels(const_cast<long*>(xids), {n});
 
-  // Not all vectors may be able to be added (some may contain NaNs
-  // etc)
-  ntotal += index_->classifyAndAddVectors(deviceVecs, deviceIds);
+  // Not all vectors may be able to be added (some may contain NaNs etc)
+  index_->classifyAndAddVectors(data, labels);
+
+  // but keep the ntotal based on the total number of vectors that we attempted
+  // to add
+  ntotal += n;
 }
 
 void
-GpuIndexIVFFlat::searchImpl_(faiss::Index::idx_t n,
+GpuIndexIVFFlat::searchImpl_(int n,
                              const float* x,
-                             faiss::Index::idx_t k,
+                             int k,
                              float* distances,
-                             faiss::Index::idx_t* labels) const {
+                             Index::idx_t* labels) const {
   // Device is already set in GpuIndex::search
   FAISS_ASSERT(index_);
   FAISS_ASSERT(n > 0);
 
-  auto stream = resources_->getDefaultStream(device_);
+  // Data is already resident on the GPU
+  Tensor<float, 2, true> queries(const_cast<float*>(x), {n, (int) this->d});
+  Tensor<float, 2, true> outDistances(distances, {n, k});
 
-  // Make sure arguments are on the device we desire; use temporary
-  // memory allocations to move it if necessary
-  auto devX =
-    toDevice<float, 2>(resources_,
-                       device_,
-                       const_cast<float*>(x),
-                       stream,
-                       {(int) n, this->d});
-  auto devDistances =
-    toDevice<float, 2>(resources_,
-                       device_,
-                       distances,
-                       stream,
-                       {(int) n, (int) k});
-  auto devLabels =
-    toDevice<faiss::Index::idx_t, 2>(resources_,
-                                     device_,
-                                     labels,
-                                     stream,
-                                     {(int) n, (int) k});
+  static_assert(sizeof(long) == sizeof(Index::idx_t), "size mismatch");
+  Tensor<long, 2, true> outLabels(const_cast<long*>(labels), {n, k});
 
-  index_->query(devX, nprobe_, k, devDistances, devLabels);
-
-  // Copy back if necessary
-  fromDevice<float, 2>(devDistances, distances, stream);
-  fromDevice<faiss::Index::idx_t, 2>(devLabels, labels, stream);
+  index_->query(queries, nprobe, k, outDistances, outLabels);
 }
 
 

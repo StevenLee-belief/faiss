@@ -1,12 +1,13 @@
 var searchData=
 [
-  ['genericdistancecomputer',['GenericDistanceComputer',['../structfaiss_1_1GenericDistanceComputer.html',1,'faiss']]],
   ['genhammingcomputer16',['GenHammingComputer16',['../structfaiss_1_1GenHammingComputer16.html',1,'faiss']]],
   ['genhammingcomputer32',['GenHammingComputer32',['../structfaiss_1_1GenHammingComputer32.html',1,'faiss']]],
   ['genhammingcomputer8',['GenHammingComputer8',['../structfaiss_1_1GenHammingComputer8.html',1,'faiss']]],
   ['genhammingcomputerm8',['GenHammingComputerM8',['../structfaiss_1_1GenHammingComputerM8.html',1,'faiss']]],
   ['gpucloneroptions',['GpuClonerOptions',['../structfaiss_1_1gpu_1_1GpuClonerOptions.html',1,'faiss::gpu']]],
   ['gpuindex',['GpuIndex',['../classfaiss_1_1gpu_1_1GpuIndex.html',1,'faiss::gpu']]],
+  ['gpuindexbinaryflat',['GpuIndexBinaryFlat',['../classfaiss_1_1gpu_1_1GpuIndexBinaryFlat.html',1,'faiss::gpu']]],
+  ['gpuindexbinaryflatconfig',['GpuIndexBinaryFlatConfig',['../structfaiss_1_1gpu_1_1GpuIndexBinaryFlatConfig.html',1,'faiss::gpu']]],
   ['gpuindexconfig',['GpuIndexConfig',['../structfaiss_1_1gpu_1_1GpuIndexConfig.html',1,'faiss::gpu']]],
   ['gpuindexflat',['GpuIndexFlat',['../classfaiss_1_1gpu_1_1GpuIndexFlat.html',1,'faiss::gpu']]],
   ['gpuindexflatconfig',['GpuIndexFlatConfig',['../structfaiss_1_1gpu_1_1GpuIndexFlatConfig.html',1,'faiss::gpu']]],

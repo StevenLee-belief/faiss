@@ -1,27 +1,31 @@
 /**
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD+Patents license found in the
+ * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
-/* Copyright 2004-present Facebook. All Rights Reserved.
-   Inverted list structure.
-*/
+// -*- c++ -*-
 
-#include "IndexIVF.h"
+#include <faiss/IndexIVF.h>
+
+
+#include <omp.h>
 
 #include <cstdio>
+#include <memory>
 
-#include "utils.h"
-#include "hamming.h"
+#include <faiss/utils/utils.h>
+#include <faiss/utils/hamming.h>
 
-#include "FaissAssert.h"
-#include "IndexFlat.h"
-#include "AuxIndexStructures.h"
+#include <faiss/impl/FaissAssert.h>
+#include <faiss/IndexFlat.h>
+#include <faiss/impl/AuxIndexStructures.h>
 
 namespace faiss {
+
+using ScopedIds = InvertedLists::ScopedIds;
+using ScopedCodes = InvertedLists::ScopedCodes;
 
 /*****************************************
  * Level1Quantizer implementation
@@ -35,6 +39,9 @@ Level1Quantizer::Level1Quantizer (Index * quantizer, size_t nlist):
     own_fields (false),
     clustering_index (nullptr)
 {
+    // here we set a low # iterations because this is typically used
+    // for large clusterings (nb this is not used for the MultiIndex,
+    // for which quantizer_trains_alone = true)
     cp.niter = 10;
 }
 
@@ -97,18 +104,60 @@ void Level1Quantizer::train_q1 (size_t n, const float *x, bool verbose, MetricTy
     }
 }
 
+size_t Level1Quantizer::coarse_code_size () const
+{
+    size_t nl = nlist - 1;
+    size_t nbyte = 0;
+    while (nl > 0) {
+        nbyte ++;
+        nl >>= 8;
+    }
+    return nbyte;
+}
+
+void Level1Quantizer::encode_listno (Index::idx_t list_no, uint8_t *code) const
+{
+    // little endian
+    size_t nl = nlist - 1;
+    while (nl > 0) {
+        *code++ = list_no & 0xff;
+        list_no >>= 8;
+        nl >>= 8;
+    }
+}
+
+Index::idx_t Level1Quantizer::decode_listno (const uint8_t *code) const
+{
+    size_t nl = nlist - 1;
+    int64_t list_no = 0;
+    int nbit = 0;
+    while (nl > 0) {
+        list_no |= int64_t(*code++) << nbit;
+        nbit += 8;
+        nl >>= 8;
+    }
+    FAISS_THROW_IF_NOT (list_no >= 0 && list_no < nlist);
+    return list_no;
+}
+
+
 
 /*****************************************
  * IndexIVF implementation
  ******************************************/
 
 
-IndexIVF::IndexIVF (Index * quantizer, size_t d, size_t nlist,
+IndexIVF::IndexIVF (Index * quantizer, size_t d,
+                    size_t nlist, size_t code_size,
                     MetricType metric):
     Index (d, metric),
     Level1Quantizer (quantizer, nlist),
+    invlists (new ArrayInvertedLists (nlist, code_size)),
+    own_invlists (true),
+    code_size (code_size),
     nprobe (1),
     max_codes (0),
+    parallel_mode (0),
     maintain_direct_map (false)
 {
     FAISS_THROW_IF_NOT (d == quantizer->d);
@@ -117,24 +166,74 @@ IndexIVF::IndexIVF (Index * quantizer, size_t d, size_t nlist,
     if (metric_type == METRIC_INNER_PRODUCT) {
         cp.spherical = true;
     }
-    // here we set a low # iterations because this is typically used
-    // for large clusterings (nb this is not used for the MultiIndex,
-    // for which quantizer_trains_alone = true)
-    code_size = 0; // let sub-classes set this
-    ids.resize (nlist);
-    codes.resize (nlist);
+
 }
 
 IndexIVF::IndexIVF ():
-    nprobe (1), max_codes (0),
+    invlists (nullptr), own_invlists (false),
+    code_size (0),
+    nprobe (1), max_codes (0), parallel_mode (0),
     maintain_direct_map (false)
 {}
-
 
 void IndexIVF::add (idx_t n, const float * x)
 {
     add_with_ids (n, x, nullptr);
 }
+
+
+void IndexIVF::add_with_ids (idx_t n, const float * x, const idx_t *xids)
+{
+    // do some blocking to avoid excessive allocs
+    idx_t bs = 65536;
+    if (n > bs) {
+        for (idx_t i0 = 0; i0 < n; i0 += bs) {
+            idx_t i1 = std::min (n, i0 + bs);
+            if (verbose) {
+                printf("   IndexIVF::add_with_ids %ld:%ld\n", i0, i1);
+            }
+            add_with_ids (i1 - i0, x + i0 * d,
+                          xids ? xids + i0 : nullptr);
+        }
+        return;
+    }
+
+    FAISS_THROW_IF_NOT (is_trained);
+    std::unique_ptr<idx_t []> idx(new idx_t[n]);
+    quantizer->assign (n, x, idx.get());
+    size_t nadd = 0, nminus1 = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (idx[i] < 0) nminus1++;
+    }
+
+    std::unique_ptr<uint8_t []> flat_codes(new uint8_t [n * code_size]);
+    encode_vectors (n, x, idx.get(), flat_codes.get());
+
+#pragma omp parallel reduction(+: nadd)
+    {
+        int nt = omp_get_num_threads();
+        int rank = omp_get_thread_num();
+
+        // each thread takes care of a subset of lists
+        for (size_t i = 0; i < n; i++) {
+            idx_t list_no = idx [i];
+            if (list_no >= 0 && list_no % nt == rank) {
+                idx_t id = xids ? xids[i] : ntotal + i;
+                invlists->add_entry (list_no, id,
+                                     flat_codes.get() + i * code_size);
+                nadd++;
+            }
+        }
+    }
+
+    if (verbose) {
+        printf("    added %ld / %ld vectors (%ld -1s)\n", nadd, n, nminus1);
+    }
+
+    ntotal += n;
+}
+
 
 void IndexIVF::make_direct_map (bool new_maintain_direct_map)
 {
@@ -145,9 +244,10 @@ void IndexIVF::make_direct_map (bool new_maintain_direct_map)
     if (new_maintain_direct_map) {
         direct_map.resize (ntotal, -1);
         for (size_t key = 0; key < nlist; key++) {
-            const std::vector<long> & idlist = ids[key];
+            size_t list_size = invlists->list_size (key);
+            ScopedIds idlist (invlists, key);
 
-            for (long ofs = 0; ofs < idlist.size(); ofs++) {
+            for (long ofs = 0; ofs < list_size; ofs++) {
                 FAISS_THROW_IF_NOT_MSG (
                        0 <= idlist [ofs] && idlist[ofs] < ntotal,
                        "direct map supported only for seuquential ids");
@@ -164,25 +264,356 @@ void IndexIVF::make_direct_map (bool new_maintain_direct_map)
 void IndexIVF::search (idx_t n, const float *x, idx_t k,
                          float *distances, idx_t *labels) const
 {
-    long * idx = new long [n * nprobe];
-    ScopeDeleter<long> del (idx);
-    float * coarse_dis = new float [n * nprobe];
-    ScopeDeleter<float> del2 (coarse_dis);
+    std::unique_ptr<idx_t[]> idx(new idx_t[n * nprobe]);
+    std::unique_ptr<float[]> coarse_dis(new float[n * nprobe]);
 
-    quantizer->search (n, x, nprobe, coarse_dis, idx);
+    double t0 = getmillisecs();
+    quantizer->search (n, x, nprobe, coarse_dis.get(), idx.get());
+    indexIVF_stats.quantization_time += getmillisecs() - t0;
 
-    search_preassigned (n, x, k, idx, coarse_dis,
+    t0 = getmillisecs();
+    invlists->prefetch_lists (idx.get(), n * nprobe);
+
+    search_preassigned (n, x, k, idx.get(), coarse_dis.get(),
                         distances, labels, false);
+    indexIVF_stats.search_time += getmillisecs() - t0;
+}
+
+
+
+void IndexIVF::search_preassigned (idx_t n, const float *x, idx_t k,
+                                   const idx_t *keys,
+                                   const float *coarse_dis ,
+                                   float *distances, idx_t *labels,
+                                   bool store_pairs,
+                                   const IVFSearchParameters *params) const
+{
+    long nprobe = params ? params->nprobe : this->nprobe;
+    long max_codes = params ? params->max_codes : this->max_codes;
+
+    size_t nlistv = 0, ndis = 0, nheap = 0;
+
+    using HeapForIP = CMin<float, idx_t>;
+    using HeapForL2 = CMax<float, idx_t>;
+
+    bool interrupt = false;
+
+    // don't start parallel section if single query
+    bool do_parallel =
+        parallel_mode == 0 ? n > 1 :
+        parallel_mode == 1 ? nprobe > 1 :
+        nprobe * n > 1;
+
+#pragma omp parallel if(do_parallel) reduction(+: nlistv, ndis, nheap)
+    {
+        InvertedListScanner *scanner = get_InvertedListScanner(store_pairs);
+        ScopeDeleter1<InvertedListScanner> del(scanner);
+
+        /*****************************************************
+         * Depending on parallel_mode, there are two possible ways
+         * to organize the search. Here we define local functions
+         * that are in common between the two
+         ******************************************************/
+
+        // intialize + reorder a result heap
+
+        auto init_result = [&](float *simi, idx_t *idxi) {
+            if (metric_type == METRIC_INNER_PRODUCT) {
+                heap_heapify<HeapForIP> (k, simi, idxi);
+            } else {
+                heap_heapify<HeapForL2> (k, simi, idxi);
+            }
+        };
+
+        auto reorder_result = [&] (float *simi, idx_t *idxi) {
+            if (metric_type == METRIC_INNER_PRODUCT) {
+                heap_reorder<HeapForIP> (k, simi, idxi);
+            } else {
+                heap_reorder<HeapForL2> (k, simi, idxi);
+            }
+        };
+
+        // single list scan using the current scanner (with query
+        // set porperly) and storing results in simi and idxi
+        auto scan_one_list = [&] (idx_t key, float coarse_dis_i,
+                                  float *simi, idx_t *idxi) {
+
+            if (key < 0) {
+                // not enough centroids for multiprobe
+                return (size_t)0;
+            }
+            FAISS_THROW_IF_NOT_FMT (key < (idx_t) nlist,
+                                    "Invalid key=%ld nlist=%ld\n",
+                                    key, nlist);
+
+            size_t list_size = invlists->list_size(key);
+
+            // don't waste time on empty lists
+            if (list_size == 0) {
+                return (size_t)0;
+            }
+
+            scanner->set_list (key, coarse_dis_i);
+
+            nlistv++;
+
+            InvertedLists::ScopedCodes scodes (invlists, key);
+
+            std::unique_ptr<InvertedLists::ScopedIds> sids;
+            const Index::idx_t * ids = nullptr;
+
+            if (!store_pairs)  {
+                sids.reset (new InvertedLists::ScopedIds (invlists, key));
+                ids = sids->get();
+            }
+
+            nheap += scanner->scan_codes (list_size, scodes.get(),
+                                          ids, simi, idxi, k);
+
+            return list_size;
+        };
+
+        /****************************************************
+         * Actual loops, depending on parallel_mode
+         ****************************************************/
+
+        if (parallel_mode == 0) {
+
+#pragma omp for
+            for (size_t i = 0; i < n; i++) {
+
+                if (interrupt) {
+                    continue;
+                }
+
+                // loop over queries
+                scanner->set_query (x + i * d);
+                float * simi = distances + i * k;
+                idx_t * idxi = labels + i * k;
+
+                init_result (simi, idxi);
+
+                long nscan = 0;
+
+                // loop over probes
+                for (size_t ik = 0; ik < nprobe; ik++) {
+
+                    nscan += scan_one_list (
+                         keys [i * nprobe + ik],
+                         coarse_dis[i * nprobe + ik],
+                         simi, idxi
+                    );
+
+                    if (max_codes && nscan >= max_codes) {
+                        break;
+                    }
+                }
+
+                ndis += nscan;
+                reorder_result (simi, idxi);
+
+                if (InterruptCallback::is_interrupted ()) {
+                    interrupt = true;
+                }
+
+            } // parallel for
+        } else if (parallel_mode == 1) {
+            std::vector <idx_t> local_idx (k);
+            std::vector <float> local_dis (k);
+
+            for (size_t i = 0; i < n; i++) {
+                scanner->set_query (x + i * d);
+                init_result (local_dis.data(), local_idx.data());
+
+#pragma omp for schedule(dynamic)
+                for (size_t ik = 0; ik < nprobe; ik++) {
+                    ndis += scan_one_list
+                        (keys [i * nprobe + ik],
+                         coarse_dis[i * nprobe + ik],
+                         local_dis.data(), local_idx.data());
+
+                    // can't do the test on max_codes
+                }
+                // merge thread-local results
+
+                float * simi = distances + i * k;
+                idx_t * idxi = labels + i * k;
+#pragma omp single
+                init_result (simi, idxi);
+
+#pragma omp barrier
+#pragma omp critical
+                {
+                    if (metric_type == METRIC_INNER_PRODUCT) {
+                        heap_addn<HeapForIP>
+                            (k, simi, idxi,
+                             local_dis.data(), local_idx.data(), k);
+                    } else {
+                        heap_addn<HeapForL2>
+                            (k, simi, idxi,
+                             local_dis.data(), local_idx.data(), k);
+                    }
+                }
+#pragma omp barrier
+#pragma omp single
+                reorder_result (simi, idxi);
+            }
+        } else {
+            FAISS_THROW_FMT ("parallel_mode %d not supported\n",
+                             parallel_mode);
+        }
+    } // parallel section
+
+    if (interrupt) {
+        FAISS_THROW_MSG ("computation interrupted");
+    }
+
+    indexIVF_stats.nq += n;
+    indexIVF_stats.nlist += nlistv;
+    indexIVF_stats.ndis += ndis;
+    indexIVF_stats.nheap_updates += nheap;
 
 }
 
+
+
+
+void IndexIVF::range_search (idx_t nx, const float *x, float radius,
+                             RangeSearchResult *result) const
+{
+    std::unique_ptr<idx_t[]> keys (new idx_t[nx * nprobe]);
+    std::unique_ptr<float []> coarse_dis (new float[nx * nprobe]);
+
+    double t0 = getmillisecs();
+    quantizer->search (nx, x, nprobe, coarse_dis.get (), keys.get ());
+    indexIVF_stats.quantization_time += getmillisecs() - t0;
+
+    t0 = getmillisecs();
+    invlists->prefetch_lists (keys.get(), nx * nprobe);
+
+    range_search_preassigned (nx, x, radius, keys.get (), coarse_dis.get (),
+                              result);
+
+    indexIVF_stats.search_time += getmillisecs() - t0;
+}
+
+void IndexIVF::range_search_preassigned (
+         idx_t nx, const float *x, float radius,
+         const idx_t *keys, const float *coarse_dis,
+         RangeSearchResult *result) const
+{
+
+    size_t nlistv = 0, ndis = 0;
+    bool store_pairs = false;
+
+    std::vector<RangeSearchPartialResult *> all_pres (omp_get_max_threads());
+
+#pragma omp parallel reduction(+: nlistv, ndis)
+    {
+        RangeSearchPartialResult pres(result);
+        std::unique_ptr<InvertedListScanner> scanner
+            (get_InvertedListScanner(store_pairs));
+        FAISS_THROW_IF_NOT (scanner.get ());
+        all_pres[omp_get_thread_num()] = &pres;
+
+        // prepare the list scanning function
+
+        auto scan_list_func = [&](size_t i, size_t ik, RangeQueryResult &qres) {
+
+            idx_t key = keys[i * nprobe + ik];  /* select the list  */
+            if (key < 0) return;
+            FAISS_THROW_IF_NOT_FMT (
+                  key < (idx_t) nlist,
+                  "Invalid key=%ld  at ik=%ld nlist=%ld\n",
+                  key, ik, nlist);
+            const size_t list_size = invlists->list_size(key);
+
+            if (list_size == 0) return;
+
+            InvertedLists::ScopedCodes scodes (invlists, key);
+            InvertedLists::ScopedIds ids (invlists, key);
+
+            scanner->set_list (key, coarse_dis[i * nprobe + ik]);
+            nlistv++;
+            ndis += list_size;
+            scanner->scan_codes_range (list_size, scodes.get(),
+                                       ids.get(), radius, qres);
+        };
+
+        if (parallel_mode == 0) {
+
+#pragma omp for
+            for (size_t i = 0; i < nx; i++) {
+                scanner->set_query (x + i * d);
+
+                RangeQueryResult & qres = pres.new_result (i);
+
+                for (size_t ik = 0; ik < nprobe; ik++) {
+                    scan_list_func (i, ik, qres);
+                }
+
+            }
+
+        } else if (parallel_mode == 1) {
+
+            for (size_t i = 0; i < nx; i++) {
+                scanner->set_query (x + i * d);
+
+                RangeQueryResult & qres = pres.new_result (i);
+
+#pragma omp for schedule(dynamic)
+                for (size_t ik = 0; ik < nprobe; ik++) {
+                    scan_list_func (i, ik, qres);
+                }
+            }
+        } else if (parallel_mode == 2) {
+            std::vector<RangeQueryResult *> all_qres (nx);
+            RangeQueryResult *qres = nullptr;
+
+#pragma omp for schedule(dynamic)
+            for (size_t iik = 0; iik < nx * nprobe; iik++) {
+                size_t i = iik / nprobe;
+                size_t ik = iik % nprobe;
+                if (qres == nullptr || qres->qno != i) {
+                    FAISS_ASSERT (!qres || i > qres->qno);
+                    qres = &pres.new_result (i);
+                    scanner->set_query (x + i * d);
+                }
+                scan_list_func (i, ik, *qres);
+            }
+        } else {
+            FAISS_THROW_FMT ("parallel_mode %d not supported\n", parallel_mode);
+        }
+        if (parallel_mode == 0) {
+            pres.finalize ();
+        } else {
+#pragma omp barrier
+#pragma omp single
+            RangeSearchPartialResult::merge (all_pres, false);
+#pragma omp barrier
+
+        }
+    }
+    indexIVF_stats.nq += nx;
+    indexIVF_stats.nlist += nlistv;
+    indexIVF_stats.ndis += ndis;
+}
+
+
+InvertedListScanner *IndexIVF::get_InvertedListScanner (
+    bool /*store_pairs*/) const
+{
+    return nullptr;
+}
 
 void IndexIVF::reconstruct (idx_t key, float* recons) const
 {
     FAISS_THROW_IF_NOT_MSG (direct_map.size() == ntotal,
                             "direct map is not initialized");
-    long list_no = direct_map[key] >> 32;
-    long offset = direct_map[key] & 0xffffffff;
+    FAISS_THROW_IF_NOT_MSG (key >= 0 && key < direct_map.size(),
+                            "invalid key");
+    idx_t list_no = direct_map[key] >> 32;
+    idx_t offset = direct_map[key] & 0xffffffff;
     reconstruct_from_offset (list_no, offset, recons);
 }
 
@@ -191,13 +622,14 @@ void IndexIVF::reconstruct_n (idx_t i0, idx_t ni, float* recons) const
 {
     FAISS_THROW_IF_NOT (ni == 0 || (i0 >= 0 && i0 + ni <= ntotal));
 
-    for (long list_no = 0; list_no < nlist; list_no++) {
-        const std::vector<long>& idlist = ids[list_no];
+    for (idx_t list_no = 0; list_no < nlist; list_no++) {
+        size_t list_size = invlists->list_size (list_no);
+        ScopedIds idlist (invlists, list_no);
 
-        for (long offset = 0; offset < idlist.size(); offset++) {
-            long id = idlist[offset];
+        for (idx_t offset = 0; offset < list_size; offset++) {
+            idx_t id = idlist[offset];
             if (!(id >= i0 && id < i0 + ni)) {
-              continue;
+                continue;
             }
 
             float* reconstructed = recons + (id - i0) * d;
@@ -207,84 +639,107 @@ void IndexIVF::reconstruct_n (idx_t i0, idx_t ni, float* recons) const
 }
 
 
+/* standalone codec interface */
+size_t IndexIVF::sa_code_size () const
+{
+    size_t coarse_size = coarse_code_size();
+    return code_size + coarse_size;
+}
+
+void IndexIVF::sa_encode (idx_t n, const float *x,
+                                 uint8_t *bytes) const
+{
+    FAISS_THROW_IF_NOT (is_trained);
+    std::unique_ptr<int64_t []> idx (new int64_t [n]);
+    quantizer->assign (n, x, idx.get());
+    encode_vectors (n, x, idx.get(), bytes, true);
+}
+
+
 void IndexIVF::search_and_reconstruct (idx_t n, const float *x, idx_t k,
                                        float *distances, idx_t *labels,
                                        float *recons) const
 {
-    long * idx = new long [n * nprobe];
-    ScopeDeleter<long> del (idx);
+    idx_t * idx = new idx_t [n * nprobe];
+    ScopeDeleter<idx_t> del (idx);
     float * coarse_dis = new float [n * nprobe];
     ScopeDeleter<float> del2 (coarse_dis);
 
     quantizer->search (n, x, nprobe, coarse_dis, idx);
+
+    invlists->prefetch_lists (idx, n * nprobe);
 
     // search_preassigned() with `store_pairs` enabled to obtain the list_no
     // and offset into `codes` for reconstruction
     search_preassigned (n, x, k, idx, coarse_dis,
                         distances, labels, true /* store_pairs */);
     for (idx_t i = 0; i < n; ++i) {
-      for (idx_t j = 0; j < k; ++j) {
-        idx_t ij = i * k + j;
-        idx_t key = labels[ij];
-        float* reconstructed = recons + ij * d;
-        if (key < 0) {
-          // Fill with NaNs
-          memset(reconstructed, -1, sizeof(*reconstructed) * d);
-        } else {
-          int list_no = key >> 32;
-          int offset = key & 0xffffffff;
+        for (idx_t j = 0; j < k; ++j) {
+            idx_t ij = i * k + j;
+            idx_t key = labels[ij];
+            float* reconstructed = recons + ij * d;
+            if (key < 0) {
+                // Fill with NaNs
+                memset(reconstructed, -1, sizeof(*reconstructed) * d);
+            } else {
+                int list_no = key >> 32;
+                int offset = key & 0xffffffff;
 
-          // Update label to the actual id
-          labels[ij] = ids[list_no][offset];
+                // Update label to the actual id
+                labels[ij] = invlists->get_single_id (list_no, offset);
 
-          reconstruct_from_offset (list_no, offset, reconstructed);
+                reconstruct_from_offset (list_no, offset, reconstructed);
+            }
         }
-      }
     }
 }
 
-void IndexIVF::reconstruct_from_offset (long list_no, long offset,
-                                        float* recons) const
-{
+void IndexIVF::reconstruct_from_offset(
+    int64_t /*list_no*/,
+    int64_t /*offset*/,
+    float* /*recons*/) const {
   FAISS_THROW_MSG ("reconstruct_from_offset not implemented");
 }
 
 void IndexIVF::reset ()
 {
+    direct_map.clear ();
+    invlists->reset ();
     ntotal = 0;
-    direct_map.clear();
-    for (size_t i = 0; i < ids.size(); i++) {
-        ids[i].clear();
-        codes[i].clear();
-    }
 }
 
 
-long IndexIVF::remove_ids (const IDSelector & sel)
+size_t IndexIVF::remove_ids (const IDSelector & sel)
 {
     FAISS_THROW_IF_NOT_MSG (!maintain_direct_map,
                     "direct map remove not implemented");
-    long nremove = 0;
-#pragma omp parallel for reduction(+: nremove)
-    for (long i = 0; i < nlist; i++) {
-        std::vector<idx_t> & idsi = ids[i];
-        uint8_t * codesi = codes[i].data();
 
-        long l = idsi.size(), j = 0;
+    std::vector<idx_t> toremove(nlist);
+
+#pragma omp parallel for
+    for (idx_t i = 0; i < nlist; i++) {
+        idx_t l0 = invlists->list_size (i), l = l0, j = 0;
+        ScopedIds idsi (invlists, i);
         while (j < l) {
             if (sel.is_member (idsi[j])) {
                 l--;
-                idsi [j] = idsi [l];
-                memmove (codesi + j * code_size,
-                         codesi + l * code_size, code_size);
+                invlists->update_entry (
+                     i, j,
+                     invlists->get_single_id (i, l),
+                     ScopedCodes (invlists, i, l).get());
             } else {
                 j++;
             }
         }
-        if (l < idsi.size()) {
-            nremove += idsi.size() - l;
-            idsi.resize (l);
-            codes[i].resize (l * code_size);
+        toremove[i] = l0 - l;
+    }
+    // this will not run well in parallel on ondisk because of possible shrinks
+    size_t nremove = 0;
+    for (idx_t i = 0; i < nlist; i++) {
+        if (toremove[i] > 0) {
+            nremove += toremove[i];
+            invlists->resize(
+                i, invlists->list_size(i) - toremove[i]);
         }
     }
     ntotal -= nremove;
@@ -306,6 +761,7 @@ void IndexIVF::train (idx_t n, const float *x)
 
     train_residual (n, x);
     is_trained = true;
+
 }
 
 void IndexIVF::train_residual(idx_t /*n*/, const float* /*x*/) {
@@ -315,67 +771,52 @@ void IndexIVF::train_residual(idx_t /*n*/, const float* /*x*/) {
 }
 
 
-
-double IndexIVF::imbalance_factor () const
-{
-    std::vector<int> hist (nlist);
-    for (int i = 0; i < nlist; i++) {
-        hist[i] = ids[i].size();
-    }
-    return faiss::imbalance_factor (nlist, hist.data());
-}
-
-void IndexIVF::print_stats () const
-{
-    std::vector<int> sizes(40);
-    for (int i = 0; i < nlist; i++) {
-        for (int j = 0; j < sizes.size(); j++) {
-            if ((ids[i].size() >> j) == 0) {
-                sizes[j]++;
-                break;
-            }
-        }
-    }
-    for (int i = 0; i < sizes.size(); i++) {
-        if (sizes[i]) {
-            printf ("list size in < %d: %d instances\n",
-                    1 << i, sizes[i]);
-        }
-    }
-
-}
-
-void IndexIVF::merge_from (IndexIVF &other, idx_t add_id)
+void IndexIVF::check_compatible_for_merge (const IndexIVF &other) const
 {
     // minimal sanity checks
     FAISS_THROW_IF_NOT (other.d == d);
     FAISS_THROW_IF_NOT (other.nlist == nlist);
+    FAISS_THROW_IF_NOT (other.code_size == code_size);
+    FAISS_THROW_IF_NOT_MSG (typeid (*this) == typeid (other),
+                  "can only merge indexes of the same type");
+}
+
+
+void IndexIVF::merge_from (IndexIVF &other, idx_t add_id)
+{
+    check_compatible_for_merge (other);
     FAISS_THROW_IF_NOT_MSG ((!maintain_direct_map &&
                              !other.maintain_direct_map),
                   "direct map copy not implemented");
-    FAISS_THROW_IF_NOT_MSG (typeid (*this) == typeid (other),
-                  "can only merge indexes of the same type");
-    for (long i = 0; i < nlist; i++) {
-        std::vector<idx_t> & src = other.ids[i];
-        std::vector<idx_t> & dest = ids[i];
-        for (long j = 0; j < src.size(); j++)
-            dest.push_back (src[j] + add_id);
-        src.clear();
-        codes[i].insert (codes[i].end(),
-                         other.codes[i].begin(),
-                         other.codes[i].end());
-        other.codes[i].clear();
-    }
+
+    invlists->merge_from (other.invlists, add_id);
 
     ntotal += other.ntotal;
     other.ntotal = 0;
 }
 
 
-void IndexIVF::copy_subset_to (IndexIVF & other, int subset_type,
-                                 long a1, long a2) const
+void IndexIVF::replace_invlists (InvertedLists *il, bool own)
 {
+    if (own_invlists) {
+        delete invlists;
+    }
+    // FAISS_THROW_IF_NOT (ntotal == 0);
+    if (il) {
+        FAISS_THROW_IF_NOT (il->nlist == nlist &&
+                            il->code_size == code_size);
+    }
+    invlists = il;
+    own_invlists = own;
+}
+
+
+void IndexIVF::copy_subset_to (IndexIVF & other, int subset_type,
+                                 idx_t a1, idx_t a2) const
+{
+
     FAISS_THROW_IF_NOT (nlist == other.nlist);
+    FAISS_THROW_IF_NOT (code_size == other.code_size);
     FAISS_THROW_IF_NOT (!other.maintain_direct_map);
     FAISS_THROW_IF_NOT_FMT (
           subset_type == 0 || subset_type == 1 || subset_type == 2,
@@ -385,32 +826,29 @@ void IndexIVF::copy_subset_to (IndexIVF & other, int subset_type,
     size_t accu_a1 = 0;
     size_t accu_a2 = 0;
 
-    for (long list_no = 0; list_no < nlist; list_no++) {
-        const std::vector<idx_t> & ids_in = ids[list_no];
-        std::vector<idx_t> & ids_out = other.ids[list_no];
-        const std::vector<uint8_t> & codes_in = codes[list_no];
-        std::vector<uint8_t> & codes_out = other.codes[list_no];
-        size_t n = ids_in.size();
+    InvertedLists *oivf = other.invlists;
+
+    for (idx_t list_no = 0; list_no < nlist; list_no++) {
+        size_t n = invlists->list_size (list_no);
+        ScopedIds ids_in (invlists, list_no);
 
         if (subset_type == 0) {
-            for (long i = 0; i < n; i++) {
+            for (idx_t i = 0; i < n; i++) {
                 idx_t id = ids_in[i];
                 if (a1 <= id && id < a2) {
-                    ids_out.push_back (id);
-                    codes_out.insert (codes_out.end(),
-                                      codes_in.begin() + i * code_size,
-                                  codes_in.begin() + (i + 1) * code_size);
+                    oivf->add_entry (list_no,
+                                     invlists->get_single_id (list_no, i),
+                                     ScopedCodes (invlists, list_no, i).get());
                     other.ntotal++;
                 }
             }
         } else if (subset_type == 1) {
-            for (long i = 0; i < n; i++) {
+            for (idx_t i = 0; i < n; i++) {
                 idx_t id = ids_in[i];
                 if (id % a1 == a2) {
-                    ids_out.push_back (id);
-                    codes_out.insert (codes_out.end(),
-                                      codes_in.begin() + i * code_size,
-                                  codes_in.begin() + (i + 1) * code_size);
+                    oivf->add_entry (list_no,
+                                     invlists->get_single_id (list_no, i),
+                                     ScopedCodes (invlists, list_no, i).get());
                     other.ntotal++;
                 }
             }
@@ -421,12 +859,13 @@ void IndexIVF::copy_subset_to (IndexIVF & other, int subset_type,
             size_t i1 = next_accu_a1 - accu_a1;
             size_t next_accu_a2 = next_accu_n * a2 / ntotal;
             size_t i2 = next_accu_a2 - accu_a2;
-            ids_out.insert(ids_out.end(),
-                           ids_in.begin() + i1,
-                           ids_in.begin() + i2);
-            codes_out.insert (codes_out.end(),
-                              codes_in.begin() + i1 * code_size,
-                              codes_in.begin() + i2 * code_size);
+
+            for (idx_t i = i1; i < i2; i++) {
+                oivf->add_entry (list_no,
+                                 invlists->get_single_id (list_no, i),
+                                 ScopedCodes (invlists, list_no, i).get());
+            }
+
             other.ntotal += i2 - i1;
             accu_a1 = next_accu_a1;
             accu_a2 = next_accu_a2;
@@ -434,81 +873,19 @@ void IndexIVF::copy_subset_to (IndexIVF & other, int subset_type,
         accu_n += n;
     }
     FAISS_ASSERT(accu_n == ntotal);
+
 }
+
 
 
 
 IndexIVF::~IndexIVF()
 {
-}
-
-
-
-/*****************************************
- * IndexIVFFlat implementation
- ******************************************/
-
-IndexIVFFlat::IndexIVFFlat (Index * quantizer,
-                            size_t d, size_t nlist, MetricType metric):
-    IndexIVF (quantizer, d, nlist, metric)
-{
-    code_size = sizeof(float) * d;
-}
-
-
-
-
-
-
-void IndexIVFFlat::add_with_ids (idx_t n, const float * x, const long *xids)
-{
-    add_core (n, x, xids, nullptr);
-}
-
-void IndexIVFFlat::add_core (idx_t n, const float * x, const long *xids,
-                             const long *precomputed_idx)
-
-{
-    FAISS_THROW_IF_NOT (is_trained);
-    FAISS_THROW_IF_NOT_MSG (!(maintain_direct_map && xids),
-                            "cannot have direct map and add with ids");
-    const long * idx;
-    ScopeDeleter<long> del;
-
-    if (precomputed_idx) {
-        idx = precomputed_idx;
-    } else {
-        long * idx0 = new long [n];
-        quantizer->assign (n, x, idx0);
-        idx = idx0;
-        del.set (idx);
+    if (own_invlists) {
+        delete invlists;
     }
-    long n_add = 0;
-    for (size_t i = 0; i < n; i++) {
-        long id = xids ? xids[i] : ntotal + i;
-        long list_no = idx [i];
-        if (list_no < 0)
-            continue;
-        assert (list_no < nlist);
-
-        ids[list_no].push_back (id);
-        const float *xi = x + i * d;
-        /* store the vectors */
-        size_t ofs = codes[list_no].size();
-        codes[list_no].resize(ofs + code_size);
-        memcpy(codes[list_no].data() + ofs,
-               xi, code_size);
-
-        if (maintain_direct_map)
-            direct_map.push_back (list_no << 32 | (ids[list_no].size() - 1));
-        n_add++;
-    }
-    if (verbose) {
-        printf("IndexIVFFlat::add_core: added %ld / %ld vectors\n",
-               n_add, n);
-    }
-    ntotal += n_add;
 }
+
 
 void IndexIVFStats::reset()
 {
@@ -518,243 +895,15 @@ void IndexIVFStats::reset()
 
 IndexIVFStats indexIVF_stats;
 
-namespace {
-
-void search_knn_inner_product (const IndexIVFFlat & ivf,
-                               size_t nx,
-                               const float * x,
-                               const long * keys,
-                               float_minheap_array_t * res,
-                               bool store_pairs)
+void InvertedListScanner::scan_codes_range (size_t ,
+                       const uint8_t *,
+                       const idx_t *,
+                       float ,
+                       RangeQueryResult &) const
 {
-
-    const size_t k = res->k;
-    size_t nlistv = 0, ndis = 0;
-    size_t d = ivf.d;
-
-#pragma omp parallel for reduction(+: nlistv, ndis)
-    for (size_t i = 0; i < nx; i++) {
-        const float * xi = x + i * d;
-        const long * keysi = keys + i * ivf.nprobe;
-        float * __restrict simi = res->get_val (i);
-        long * __restrict idxi = res->get_ids (i);
-        minheap_heapify (k, simi, idxi);
-        size_t nscan = 0;
-
-        for (size_t ik = 0; ik < ivf.nprobe; ik++) {
-            long key = keysi[ik];  /* select the list  */
-            if (key < 0) {
-                // not enough centroids for multiprobe
-                continue;
-            }
-            FAISS_THROW_IF_NOT_FMT (
-                key < (long) ivf.nlist,
-                "Invalid key=%ld  at ik=%ld nlist=%ld\n",
-                key, ik, ivf.nlist);
-
-            nlistv++;
-            const size_t list_size = ivf.ids[key].size();
-            const float * list_vecs = (const float*)(ivf.codes[key].data());
-
-            for (size_t j = 0; j < list_size; j++) {
-                const float * yj = list_vecs + d * j;
-                float ip = fvec_inner_product (xi, yj, d);
-                if (ip > simi[0]) {
-                    minheap_pop (k, simi, idxi);
-                    long id = store_pairs ? (key << 32 | j) : ivf.ids[key][j];
-                    minheap_push (k, simi, idxi, ip, id);
-                }
-            }
-            nscan += list_size;
-            if (ivf.max_codes && nscan >= ivf.max_codes)
-                break;
-        }
-        ndis += nscan;
-        minheap_reorder (k, simi, idxi);
-    }
-    indexIVF_stats.nq += nx;
-    indexIVF_stats.nlist += nlistv;
-    indexIVF_stats.ndis += ndis;
+    FAISS_THROW_MSG ("scan_codes_range not implemented");
 }
 
-
-void search_knn_L2sqr (const IndexIVFFlat &ivf,
-                       size_t nx,
-                       const float * x,
-                       const long * keys,
-                       float_maxheap_array_t * res,
-                       bool store_pairs)
-{
-    const size_t k = res->k;
-    size_t nlistv = 0, ndis = 0;
-    size_t d = ivf.d;
-#pragma omp parallel for reduction(+: nlistv, ndis)
-    for (size_t i = 0; i < nx; i++) {
-        const float * xi = x + i * d;
-        const long * keysi = keys + i * ivf.nprobe;
-        float * __restrict disi = res->get_val (i);
-        long * __restrict idxi = res->get_ids (i);
-        maxheap_heapify (k, disi, idxi);
-
-        size_t nscan = 0;
-
-        for (size_t ik = 0; ik < ivf.nprobe; ik++) {
-            long key = keysi[ik];  /* select the list  */
-            if (key < 0) {
-                // not enough centroids for multiprobe
-                continue;
-            }
-            FAISS_THROW_IF_NOT_FMT (
-                key < (long) ivf.nlist,
-                "Invalid key=%ld  at ik=%ld nlist=%ld\n",
-                key, ik, ivf.nlist);
-
-            nlistv++;
-            const size_t list_size = ivf.ids[key].size();
-            const float * list_vecs = (const float*)(ivf.codes[key].data());
-
-            for (size_t j = 0; j < list_size; j++) {
-                const float * yj = list_vecs + d * j;
-                float disij = fvec_L2sqr (xi, yj, d);
-                if (disij < disi[0]) {
-                    maxheap_pop (k, disi, idxi);
-                    long id = store_pairs ? (key << 32 | j) : ivf.ids[key][j];
-                    maxheap_push (k, disi, idxi, disij, id);
-                }
-            }
-            nscan += list_size;
-            if (ivf.max_codes && nscan >= ivf.max_codes)
-                break;
-        }
-        ndis += nscan;
-        maxheap_reorder (k, disi, idxi);
-    }
-    indexIVF_stats.nq += nx;
-    indexIVF_stats.nlist += nlistv;
-    indexIVF_stats.ndis += ndis;
-}
-
-
-} // anonymous namespace
-
-void IndexIVFFlat::search_preassigned (idx_t n, const float *x, idx_t k,
-                                     const idx_t *idx,
-                                      const float * /* coarse_dis */,
-                                      float *distances, idx_t *labels,
-                                      bool store_pairs) const
-{
-   if (metric_type == METRIC_INNER_PRODUCT) {
-        float_minheap_array_t res = {
-            size_t(n), size_t(k), labels, distances};
-        search_knn_inner_product (*this, n, x, idx, &res, store_pairs);
-
-    } else if (metric_type == METRIC_L2) {
-        float_maxheap_array_t res = {
-            size_t(n), size_t(k), labels, distances};
-        search_knn_L2sqr (*this, n, x, idx, &res, store_pairs);
-    }
-}
-
-
-void IndexIVFFlat::range_search (idx_t nx, const float *x, float radius,
-                                 RangeSearchResult *result) const
-{
-    idx_t * keys = new idx_t [nx * nprobe];
-    ScopeDeleter<idx_t> del (keys);
-    quantizer->assign (nx, x, keys, nprobe);
-
-#pragma omp parallel
-    {
-        RangeSearchPartialResult pres(result);
-
-        for (size_t i = 0; i < nx; i++) {
-            const float * xi = x + i * d;
-            const long * keysi = keys + i * nprobe;
-
-            RangeSearchPartialResult::QueryResult & qres =
-                pres.new_result (i);
-
-            for (size_t ik = 0; ik < nprobe; ik++) {
-                long key = keysi[ik];  /* select the list  */
-                if (key < 0 || key >= (long) nlist) {
-                    fprintf (stderr, "Invalid key=%ld  at ik=%ld nlist=%ld\n",
-                             key, ik, nlist);
-                    throw;
-                }
-
-                const size_t list_size = ids[key].size();
-                const float * list_vecs = (const float *)(codes[key].data());
-
-                for (size_t j = 0; j < list_size; j++) {
-                    const float * yj = list_vecs + d * j;
-                    if (metric_type == METRIC_L2) {
-                        float disij = fvec_L2sqr (xi, yj, d);
-                        if (disij < radius) {
-                            qres.add (disij, ids[key][j]);
-                        }
-                    } else if (metric_type == METRIC_INNER_PRODUCT) {
-                        float disij = fvec_inner_product(xi, yj, d);
-                        if (disij > radius) {
-                            qres.add (disij, ids[key][j]);
-                        }
-                    }
-                }
-            }
-        }
-
-        pres.finalize ();
-    }
-}
-
-void IndexIVFFlat::update_vectors (int n, idx_t *new_ids, const float *x)
-{
-    FAISS_THROW_IF_NOT (maintain_direct_map);
-    FAISS_THROW_IF_NOT (is_trained);
-    std::vector<idx_t> assign (n);
-    quantizer->assign (n, x, assign.data());
-
-    for (int i = 0; i < n; i++) {
-        idx_t id = new_ids[i];
-        FAISS_THROW_IF_NOT_MSG (0 <= id && id < ntotal,
-                                "id to update out of range");
-        { // remove old one
-            long dm = direct_map[id];
-            long ofs = dm & 0xffffffff;
-            long il = dm >> 32;
-            size_t l = ids[il].size();
-            if (ofs != l - 1) {
-                long id2 = ids[il].back();
-                ids[il][ofs] = id2;
-                direct_map[id2] = (il << 32) | ofs;
-                float * vecs = (float*)codes[il].data();
-                memcpy (vecs + ofs * d,
-                        vecs + (l - 1) * d,
-                        d * sizeof(float));
-            }
-            ids[il].pop_back();
-            codes[il].resize((l - 1) * code_size);
-        }
-        { // insert new one
-            long il = assign[i];
-            size_t l = ids[il].size();
-            long dm = (il << 32) | l;
-            direct_map[id] = dm;
-            ids[il].push_back (id);
-            codes[il].resize((l + 1) * code_size);
-            float * vecs = (float*)codes[il].data();
-            memcpy (vecs + l * d,
-                    x + i * d,
-                    d * sizeof(float));
-        }
-    }
-
-}
-
-void IndexIVFFlat::reconstruct_from_offset (long list_no, long offset,
-                                            float* recons) const
-{
-    memcpy (recons, &codes[list_no][offset * code_size], d * sizeof(recons[0]));
-}
 
 
 } // namespace faiss

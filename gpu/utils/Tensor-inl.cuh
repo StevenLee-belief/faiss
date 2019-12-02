@@ -1,15 +1,13 @@
 /**
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD+Patents license found in the
+ * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
-// Copyright 2004-present Facebook. All Rights Reserved.
 
-#include "../GpuFaissAssert.h"
-#include "DeviceUtils.h"
+#include <faiss/gpu/GpuFaissAssert.h>
+#include <faiss/gpu/utils/DeviceUtils.h>
 #include <limits>
 
 namespace faiss { namespace gpu {
@@ -309,6 +307,11 @@ __host__ __device__ bool
 Tensor<T, Dim, InnerContig, IndexT, PtrTraits>::canCastResize() const {
   static_assert(sizeof(U) >= sizeof(T), "only handles greater sizes");
   constexpr int kMultiple = sizeof(U) / sizeof(T);
+
+  // Ensure that the base pointer is sizeof(U) aligned
+  if (((uintptr_t) data_) % sizeof(U) != 0) {
+    return false;
+  }
 
   // Check all outer strides
   for (int i = 0; i < Dim - 1; ++i) {

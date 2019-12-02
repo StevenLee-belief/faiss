@@ -1,12 +1,10 @@
 /**
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD+Patents license found in the
+ * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
-// Copyright 2004-present Facebook. All Rights Reserved.
 // -*- c++ -*-
 
 #ifndef FAISS_INDEX_IVF_H
@@ -14,11 +12,12 @@
 
 
 #include <vector>
+#include <stdint.h>
 
-
-#include "Index.h"
-#include "Clustering.h"
-#include "Heap.h"
+#include <faiss/Index.h>
+#include <faiss/InvertedLists.h>
+#include <faiss/Clustering.h>
+#include <faiss/utils/Heap.h>
 
 
 namespace faiss {
@@ -32,6 +31,7 @@ namespace faiss {
 struct Level1Quantizer {
     Index * quantizer;        ///< quantizer that maps vectors to inverted lists
     size_t nlist;             ///< number of possible key values
+
 
     /**
      * = 0: use the quantizer as index in a kmeans training
@@ -48,6 +48,12 @@ struct Level1Quantizer {
     void train_q1 (size_t n, const float *x, bool verbose,
                    MetricType metric_type);
 
+
+    /// compute the number of bytes required to store list ids
+    size_t coarse_code_size () const;
+    void encode_listno (Index::idx_t list_no, uint8_t *code) const;
+    Index::idx_t decode_listno (const uint8_t *code) const;
+
     Level1Quantizer (Index * quantizer, size_t nlist);
 
     Level1Quantizer ();
@@ -57,12 +63,26 @@ struct Level1Quantizer {
 };
 
 
+
+struct IVFSearchParameters {
+    size_t nprobe;            ///< number of probes at query time
+    size_t max_codes;         ///< max nb of codes to visit to do a query
+    virtual ~IVFSearchParameters () {}
+};
+
+
+
+struct InvertedListScanner;
+
 /** Index based on a inverted file (IVF)
  *
  * In the inverted file, the quantizer (an Index instance) provides a
  * quantization index for each vector to be added. The quantization
  * index maps to a list (aka inverted list or posting list), where the
- * id of the vector is then stored.
+ * id of the vector is stored.
+ *
+ * The inverted list object is required only after trainng. If none is
+ * set externally, an ArrayInvertedLists is used automatically.
  *
  * At search time, the vector to be searched is also quantized, and
  * only the list corresponding to the quantization index is
@@ -75,24 +95,34 @@ struct Level1Quantizer {
  * the distance estimation from the query to databse vectors.
  */
 struct IndexIVF: Index, Level1Quantizer {
+    /// Acess to the actual data
+    InvertedLists *invlists;
+    bool own_invlists;
+
+    size_t code_size;              ///< code size per vector in bytes
+
     size_t nprobe;            ///< number of probes at query time
     size_t max_codes;         ///< max nb of codes to visit to do a query
 
-    std::vector < std::vector<long> > ids;  ///< Inverted lists for indexes
-
-    size_t code_size;              ///< code size per vector in bytes
-    std::vector < std::vector<uint8_t> > codes; // binary codes, size nlist
+    /** Parallel mode determines how queries are parallelized with OpenMP
+     *
+     * 0 (default): parallelize over queries
+     * 1: parallelize over over inverted lists
+     * 2: parallelize over both
+     */
+    int parallel_mode;
 
     /// map for direct access to the elements. Enables reconstruct().
     bool maintain_direct_map;
-    std::vector <long> direct_map;
+    std::vector <idx_t> direct_map;
 
     /** The Inverted file takes a quantizer (an Index) on input,
      * which implements the function mapping a vector to a list
      * identifier. The pointer is borrowed: the quantizer should not
      * be deleted while the IndexIVF is in use.
      */
-    IndexIVF (Index * quantizer, size_t d, size_t nlist,
+    IndexIVF (Index * quantizer, size_t d,
+              size_t nlist, size_t code_size,
               MetricType metric = METRIC_L2);
 
     void reset() override;
@@ -100,17 +130,34 @@ struct IndexIVF: Index, Level1Quantizer {
     /// Trains the quantizer and calls train_residual to train sub-quantizers
     void train(idx_t n, const float* x) override;
 
-    /// Quantizes x and calls add_with_key
+    /// Calls add_with_ids with NULL ids
     void add(idx_t n, const float* x) override;
+
+    /// default implementation that calls encode_vectors
+    void add_with_ids(idx_t n, const float* x, const idx_t* xids) override;
+
+    /** Encodes a set of vectors as they would appear in the inverted lists
+     *
+     * @param list_nos   inverted list ids as returned by the
+     *                   quantizer (size n). -1s are ignored.
+     * @param codes      output codes, size n * code_size
+     * @param include_listno
+     *                   include the list ids in the code (in this case add
+     *                   ceil(log8(nlist)) to the code size)
+     */
+    virtual void encode_vectors(idx_t n, const float* x,
+                                const idx_t *list_nos,
+                                uint8_t * codes,
+                                bool include_listno = false) const = 0;
 
     /// Sub-classes that encode the residuals can train their encoders here
     /// does nothing by default
     virtual void train_residual (idx_t n, const float *x);
 
-
     /** search a set of vectors, that are pre-quantized by the IVF
      *  quantizer. Fill in the corresponding heaps with the query
-     *  results. search() calls this.
+     *  results. The default implementation uses InvertedListScanners
+     *  to do the search.
      *
      * @param n      nb of vectors to query
      * @param x      query vectors, size nx * d
@@ -123,16 +170,30 @@ struct IndexIVF: Index, Level1Quantizer {
      * @param store_pairs store inv list index + inv list offset
      *                     instead in upper/lower 32 bit of result,
      *                     instead of ids (used for reranking).
+     * @param params used to override the object's search parameters
      */
     virtual void search_preassigned (idx_t n, const float *x, idx_t k,
                                      const idx_t *assign,
                                      const float *centroid_dis,
                                      float *distances, idx_t *labels,
-                                     bool store_pairs) const = 0;
+                                     bool store_pairs,
+                                     const IVFSearchParameters *params=nullptr
+                                     ) const;
 
     /** assign the vectors, then call search_preassign */
-    virtual void search (idx_t n, const float *x, idx_t k,
-                         float *distances, idx_t *labels) const override;
+    void search (idx_t n, const float *x, idx_t k,
+                 float *distances, idx_t *labels) const override;
+
+    void range_search (idx_t n, const float* x, float radius,
+                       RangeSearchResult* result) const override;
+
+    void range_search_preassigned(idx_t nx, const float *x, float radius,
+                                  const idx_t *keys, const float *coarse_dis,
+                                  RangeSearchResult *result) const;
+
+    /// get a scanner for this index (store_pairs means ignore labels)
+    virtual InvertedListScanner *get_InvertedListScanner (
+        bool store_pairs=false) const;
 
     void reconstruct (idx_t key, float* recons) const override;
 
@@ -167,13 +228,18 @@ struct IndexIVF: Index, Level1Quantizer {
      * the inv list offset is computed by search_preassigned() with
      * `store_pairs` set.
      */
-    virtual void reconstruct_from_offset (long list_no, long offset,
+    virtual void reconstruct_from_offset (int64_t list_no, int64_t offset,
                                           float* recons) const;
 
 
     /// Dataset manipulation functions
 
-    long remove_ids(const IDSelector& sel) override;
+    size_t remove_ids(const IDSelector& sel) override;
+
+    /** check that the two indexes are compatible (ie, they are
+     * trained in the same way and have the same
+     * parameters). Otherwise throw. */
+    void check_compatible_for_merge (const IndexIVF &other) const;
 
     /** moves the entries from another dataset to self. On output,
      * other is empty. add_id is added to all moved ids (for
@@ -188,12 +254,12 @@ struct IndexIVF: Index, Level1Quantizer {
      *                      elements are left before and a2 elements are after
      */
     virtual void copy_subset_to (IndexIVF & other, int subset_type,
-                                 long a1, long a2) const;
+                                 idx_t a1, idx_t a2) const;
 
     ~IndexIVF() override;
 
     size_t get_list_size (size_t list_no) const
-    { return ids[list_no].size(); }
+    { return invlists->list_size(list_no); }
 
     /** intialize a direct map
      *
@@ -202,13 +268,66 @@ struct IndexIVF: Index, Level1Quantizer {
      */
     void make_direct_map (bool new_maintain_direct_map=true);
 
-    /// 1= perfectly balanced, >1: imbalanced
-    double imbalance_factor () const;
+    /// replace the inverted lists, old one is deallocated if own_invlists
+    void replace_invlists (InvertedLists *il, bool own=false);
 
-    /// display some stats about the inverted lists
-    void print_stats () const;
+    /* The standalone codec interface (except sa_decode that is specific) */
+    size_t sa_code_size () const override;
+
+    void sa_encode (idx_t n, const float *x,
+                          uint8_t *bytes) const override;
 
     IndexIVF ();
+};
+
+struct RangeQueryResult;
+
+/** Object that handles a query. The inverted lists to scan are
+ * provided externally. The object has a lot of state, but
+ * distance_to_code and scan_codes can be called in multiple
+ * threads */
+struct InvertedListScanner {
+
+    using idx_t = Index::idx_t;
+
+    /// from now on we handle this query.
+    virtual void set_query (const float *query_vector) = 0;
+
+    /// following codes come from this inverted list
+    virtual void set_list (idx_t list_no, float coarse_dis) = 0;
+
+    /// compute a single query-to-code distance
+    virtual float distance_to_code (const uint8_t *code) const = 0;
+
+    /** scan a set of codes, compute distances to current query and
+     * update heap of results if necessary.
+     *
+     * @param n      number of codes to scan
+     * @param codes  codes to scan (n * code_size)
+     * @param ids        corresponding ids (ignored if store_pairs)
+     * @param distances  heap distances (size k)
+     * @param labels     heap labels (size k)
+     * @param k          heap size
+     * @return number of heap updates performed
+     */
+    virtual size_t scan_codes (size_t n,
+                               const uint8_t *codes,
+                               const idx_t *ids,
+                               float *distances, idx_t *labels,
+                               size_t k) const = 0;
+
+    /** scan a set of codes, compute distances to current query and
+     * update results if distances are below radius
+     *
+     * (default implementation fails) */
+    virtual void scan_codes_range (size_t n,
+                                   const uint8_t *codes,
+                                   const idx_t *ids,
+                                   float radius,
+                                   RangeQueryResult &result) const;
+
+    virtual ~InvertedListScanner () {}
+
 };
 
 
@@ -216,6 +335,9 @@ struct IndexIVFStats {
     size_t nq;       // nb of queries run
     size_t nlist;    // nb of inverted lists scanned
     size_t ndis;     // nb of distancs computed
+    size_t nheap_updates; // nb of times the heap was updated
+    double quantization_time; // time spent quantizing vectors (in ms)
+    double search_time;       // time spent searching lists (in ms)
 
     IndexIVFStats () {reset (); }
     void reset ();
@@ -225,60 +347,7 @@ struct IndexIVFStats {
 extern IndexIVFStats indexIVF_stats;
 
 
-
-
-
-/** Inverted file with stored vectors. Here the inverted file
- * pre-selects the vectors to be searched, but they are not otherwise
- * encoded, the code array just contains the raw float entries.
- */
-struct IndexIVFFlat: IndexIVF {
-
-    IndexIVFFlat (
-            Index * quantizer, size_t d, size_t nlist_,
-            MetricType = METRIC_L2);
-
-    /// same as add_with_ids, with precomputed coarse quantizer
-    virtual void add_core (idx_t n, const float * x, const long *xids,
-                   const long *precomputed_idx);
-
-    /// implemented for all IndexIVF* classes
-    void add_with_ids(idx_t n, const float* x, const long* xids) override;
-
-    void search_preassigned (idx_t n, const float *x, idx_t k,
-                             const idx_t *assign,
-                             const float *centroid_dis,
-                             float *distances, idx_t *labels,
-                             bool store_pairs) const override;
-
-    void range_search(
-        idx_t n,
-        const float* x,
-        float radius,
-        RangeSearchResult* result) const override;
-
-    /** Update a subset of vectors.
-     *
-     * The index must have a direct_map
-     *
-     * @param nv     nb of vectors to update
-     * @param idx    vector indices to update, size nv
-     * @param v      vectors of new values, size nv*d
-     */
-    void update_vectors (int nv, idx_t *idx, const float *v);
-
-    void reconstruct_from_offset (long list_no, long offset,
-                                  float* recons) const override;
-
-    IndexIVFFlat () {}
-};
-
-
-
 } // namespace faiss
-
-
-
 
 
 #endif
